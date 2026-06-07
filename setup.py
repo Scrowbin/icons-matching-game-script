@@ -40,6 +40,7 @@ def setup():
         select_regions(
             "sample/question.png",
             [
+                "question_state_roi",  # NEW
                 "question_icon_1",
                 "question_label_1",
                 "question_icon_2",
@@ -54,6 +55,7 @@ def setup():
         select_regions(
             "sample/answer.png",
             [
+                "answer_state_roi",    # NEW
                 "answer_icon",
                 "answer_1",
                 "answer_2",
