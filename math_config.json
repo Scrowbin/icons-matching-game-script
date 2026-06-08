@@ -2,6 +2,6 @@
     "game_name": "Taboo in the Classroom",
     "question_confidence_threshold": 0.85,
     "answer_confidence_threshold": 0.9,
-    "question_image": "sample/question.png",
-    "answer_image": "sample/answer.png"
+    "question_image": "sample/math_question.png",
+    "answer_image": "sample/math_answer.png"
     }

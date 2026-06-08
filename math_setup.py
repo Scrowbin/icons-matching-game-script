@@ -1,6 +1,10 @@
 import cv2
 import json
 
+CONFIG_FILE = "math_config.json"
+REGION_FILE = "math_regions.json"
+
+
 def select_regions(img_path, region_names):
     img = cv2.imread(img_path)
 
@@ -34,40 +38,40 @@ def select_regions(img_path, region_names):
 
 
 def setup():
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+
+    question_image = config["question_image"]
+    answer_image = config["answer_image"]
+
     regions = {}
 
     regions.update(
         select_regions(
-            "sample/question.png",
+            question_image,
             [
-                "question_state_roi",  # NEW
-                "question_icon_1",
-                "question_label_1",
-                "question_icon_2",
-                "question_label_2",
-                "question_icon_3",
-                "question_label_3"
+                "question_state_roi",
+                "question",
             ]
         )
     )
 
     regions.update(
         select_regions(
-            "sample/answer.png",
+            answer_image,
             [
-                "answer_state_roi",    # NEW
-                "answer_icon",
-                "answer_1",
-                "answer_2",
-                "answer_3"
+                "answer_state_roi",
+                "jump_1_button",
+                "jump_5_button",
+                "next_button",
             ]
         )
     )
 
-    with open("regions.json", "w") as f:
+    with open(REGION_FILE, "w") as f:
         json.dump(regions, f, indent=4)
 
-    print("Saved regions.json")
+    print(f"Saved {REGION_FILE}")
 
 
 if __name__ == "__main__":
