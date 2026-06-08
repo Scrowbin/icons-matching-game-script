@@ -3,9 +3,18 @@ import cv2
 import numpy as np
 import time
 import json
-from skimage.metrics import structural_similarity
+import os
+from datetime import datetime
+from pathlib import Path
+
+# Global Debug Toggle
+DEBUG_MODE = True
+
 CONFIG_FILE = "game_config.json"
 REGION_FILE = "regions.json"
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+batch_counter = 0
 
 with open(CONFIG_FILE, 'r') as f:
     config = json.load(f)
@@ -37,16 +46,13 @@ def get_game_window():
         print(f"ERROR: Could not find a window with title '{WINDOW_TITLE}'.")
         exit()
     win = windows[0]
-
     return win
 
 def activate_windows(win):
     if win.isMinimized:
         win.restore()
-
         while win.isMinimized:
             time.sleep(0.05)
-
     if not win.isActive:
         win.activate()
         time.sleep(0.2)
@@ -54,69 +60,89 @@ def activate_windows(win):
 def screenshot_game():
     win = get_game_window()
     activate_windows(win)
-
     left, top = win.topleft
     right, bottom = win.bottomright
+    screenshot = pyautogui.screenshot(region=(left, top, right-left, bottom-top))
+    return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
 
-    screenshot = pyautogui.screenshot(
-        region=(left, top, right-left, bottom-top)
-    )
-
-    return cv2.cvtColor(
-        np.array(screenshot),
-        cv2.COLOR_RGB2BGR
-    )
-
-def similarity_score(img, template):
-    result = cv2.matchTemplate(
-        img,
-        template,
-        cv2.TM_CCOEFF_NORMED
-    )
-    return float(result.max())
+def click_region(region, debug=False):
+    win = get_game_window()
+    rx, ry, rw, rh = region
+    x = win.left + int((rx + rw / 2) * win.width)
+    y = win.top  + int((ry + rh / 2) * win.height)
+    if debug:
+        print(f"Clicking ({x}, {y})")
+    pyautogui.click(x, y)
 
 def crop_region(image, region, debug=False):
     img_h, img_w = image.shape[:2]
-
     rx, ry, rw, rh = region
-
     x = int(rx * img_w)
     y = int(ry * img_h)
     w = int(rw * img_w)
     h = int(rh * img_h)
-
     if debug:
-        print(
-            f"x={x}, y={y}, w={w}, h={h}, "
-            f"img_w={img_w}, img_h={img_h}"
-        )
-
+        print(f"x={x}, y={y}, w={w}, h={h}, img_w={img_w}, img_h={img_h}")
     crop = image[y:y+h, x:x+w]
-
-    if debug:
-        print("crop shape:", crop.shape)
-
     return crop
 
-def compare_images(img1, img2):
+def preprocess(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
+
+def preprocess_icon(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower = np.array([90, 20, 100])
+    upper = np.array([180, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    return mask
+
+def similarity_score(img1, img2):
+    """
+    Safely handles shape alignment, empty/black mask conditions, 
+    and returns the maximum template matching correlation value.
+    """
     h = min(img1.shape[0], img2.shape[0])
     w = min(img1.shape[1], img2.shape[1])
 
-    img1 = cv2.resize(img1, (w, h))
-    img2 = cv2.resize(img2, (w, h))
+    if h == 0 or w == 0:
+        return 0.0
 
-    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    # Align dimensions dynamically
+    img1_resized = cv2.resize(img1, (w, h))
+    img2_resized = cv2.resize(img2, (w, h))
 
-    score, _ = structural_similarity(
-        gray1,
-        gray2,
-        full=True
-    )
+    # Safeguard against completely empty/black frames (prevents matchTemplate zero-division crash)
+    if len(img1_resized.shape) == 2:
+        nz1 = cv2.countNonZero(img1_resized)
+        nz2 = cv2.countNonZero(img2_resized)
+    else:
+        nz1 = 1 if np.any(img1_resized) else 0
+        nz2 = 1 if np.any(img2_resized) else 0
 
-    return score
+    if nz1 == 0 and nz2 == 0:
+        return 1.0  # Both elements are empty / identical blanks
+    if nz1 == 0 or nz2 == 0:
+        return 0.0  # One contains an item, the other is completely blank
 
-def question_phase(image):
+    result = cv2.matchTemplate(img1_resized, img2_resized, cv2.TM_CCOEFF_NORMED)
+    return float(result.max())
+
+def save_image_pair(folder, name, img, is_icon=False):
+    raw_path = folder / f"{name}_raw.png"
+    thresh_path = folder / f"{name}_thresholded.png"
+    cv2.imwrite(str(raw_path), img)
+    
+    if is_icon:
+        cv2.imwrite(str(thresh_path), preprocess_icon(img))
+    else:
+        cv2.imwrite(str(thresh_path), preprocess(img))
+
+    return {"raw": str(raw_path), "thresholded": str(thresh_path)}
+
+def question_phase(image, debug=False):
+    global batch_counter
     cropped_icon1 = crop_region(image, QUESTION_ICON1)
     cropped_icon2 = crop_region(image, QUESTION_ICON2)
     cropped_icon3 = crop_region(image, QUESTION_ICON3)
@@ -124,54 +150,120 @@ def question_phase(image):
     cropped_label2 = crop_region(image, QUESTION_LABEL2)
     cropped_label3 = crop_region(image, QUESTION_LABEL3)
 
-    return [
+    question_phase_data = [
         (cropped_icon1, cropped_label1),
         (cropped_icon2, cropped_label2),
         (cropped_icon3, cropped_label3)
     ]
-def answer_phase(image,memory,debug=False):
-    # Implement the logic for the answer phase here
+
+    if debug:
+        batch_counter += 1
+        batch_dir = Path(LOG_DIR) / f"batch_{batch_counter:04d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+
+        question_log = {"icons": [], "labels": []}
+        for i, (icon, label) in enumerate(question_phase_data, start=1):
+            question_log["icons"].append(save_image_pair(batch_dir, f"question_icon_{i}", icon, is_icon=True))
+            question_log["labels"].append(save_image_pair(batch_dir, f"question_label_{i}", label, is_icon=False))
+        return question_phase_data, question_log, batch_dir
+    
+    return question_phase_data
+
+def answer_phase(image, memory, batch_dir, question_log, debug=False):
     answer_icon = crop_region(image, ANSWER_ICON)
     cropped_answer1 = crop_region(image, ANSWER1)
     cropped_answer2 = crop_region(image, ANSWER2)
     cropped_answer3 = crop_region(image, ANSWER3)
 
-    assert memory is not None, "Memory should be initialized as an empty dictionary if not provided."
+    assert memory is not None, "Memory should be initialized."
 
-    last_similarity_score = -1
-    correct_icon = None
+    icon_scores = []
+    best_icon_score = -1
+    best_icon_idx = None
 
-    for icon_img, label_img in memory:
+    mask_answer = preprocess_icon(answer_icon)
+
+    for i, (icon_img, _) in enumerate(memory):
         if icon_img is not None:
-            score = compare_images(answer_icon, icon_img)
+            mask_question = preprocess_icon(icon_img)
+
+            # Clean and unclogged comparison call
+            score = similarity_score(mask_answer, mask_question)
+            
+            icon_scores.append({
+                "question_icon": i + 1,
+                "score": float(score)
+            })
+            
             if debug:
-                print(f"Comparing answer icon with question icon, similarity score: {score:.4f}")
-            if score > last_similarity_score:
-                last_similarity_score = score
-                correct_icon = icon_img
-                correct_label = label_img
-                if debug:
-                    print(f"New best match found with score {score:.4f}")
-                    cv2.imshow("Best Match", correct_icon)
-                    cv2.waitKey(0)
+                print(f"Comparing answer icon with question icon {i+1}, score: {score:.4f}")
+            
+            if score > best_icon_score:
+                best_icon_score = score
+                best_icon_idx = i
 
-    last_similarity_score = 0
-    correct_answer = None
-
-    for cropped_answer in cropped_answer1, cropped_answer2, cropped_answer3:
-        score = compare_images(correct_label, cropped_answer)
+    # --- AMBIGUITY CHECK ---
+    if len(icon_scores) >= 2:
+        sorted_icon_scores = sorted([s["score"] for s in icon_scores], reverse=True)
+        margin = sorted_icon_scores[0] - sorted_icon_scores[1]
+        
         if debug:
-            print(f"Comparing answer icon with the cropped answer, similarity score: {score:.4f}")
-        if score > last_similarity_score:
-            last_similarity_score = score
-            correct_answer = cropped_answer
-        if debug:
-            print(f"New best match found with score {score:.4f}")
-            cv2.imshow("Best Match", correct_answer)
-            cv2.waitKey(0)
+            print(f"Icon match margin (1st vs 2nd): {margin:.4f}")
+            
+        if margin < 0.05:
+            print("Icon match too ambiguous (margin < 0.05), skipping click.")
+            return None
+    
+    if debug:
+        print(f"Best icon match: {best_icon_idx + 1} with score {best_icon_score:.4f}")
 
-    cv2.imshow("Best Match", correct_answer)
-    cv2.waitKey(0)
+    answers = [cropped_answer1, cropped_answer2, cropped_answer3]
+    answer_scores = []
+    best_idx = None
+    best_score = -1
+
+    for i, answer in enumerate(answers):
+        # Clean label comparison using the unified similarity_score function
+        score = similarity_score(
+            preprocess(memory[best_icon_idx][1]),
+            preprocess(answer)
+        )
+        answer_scores.append({
+            "answer": i + 1,
+            "score": float(score)
+        })
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if debug:
+        answer_log = {}
+        answer_log["answer_icon"] = save_image_pair(batch_dir, "answer_icon", answer_icon, is_icon=True)
+
+        for i, ans in enumerate(answers, start=1):
+            answer_log[f"answer_{i}"] = save_image_pair(batch_dir, f"answer_{i}", ans, is_icon=False)
+
+        log_entry = {
+            "timestamp": time.time(),
+            "matched_question_icon": best_icon_idx + 1 if best_icon_idx is not None else None,
+            "icon_similarity": float(best_icon_score),
+            "icon_margin": float(margin) if 'margin' in locals() else None,
+            "answer_scores": answer_scores,
+            "selected_answer": best_idx + 1 if best_idx is not None else None,
+            "selected_answer_score": float(best_score),
+            "question_files": question_log,
+            "answer_files": answer_log
+        }
+        with open(batch_dir / "decision.json", "w") as f:
+            json.dump(log_entry, f, indent=4)
+            
+    if best_score < 0.6:
+        print("Confidence too low, skipping click")
+        return None
+    
+    print(f"Selected answer {best_idx + 1} (score={best_score:.4f})")
+    return best_idx
 
 def run_game():
     state = "not started"
@@ -186,9 +278,8 @@ def run_game():
         RegionQuestion = crop_region(image, region_config.get("question_state_roi", [0, 0, 0, 0]))
         RegionAnswer = crop_region(image, region_config.get("answer_state_roi", [0, 0, 0, 0]))
         
-        #check what state it is
-        answer_similarity_score = compare_images(RegionAnswer, ANSWER_SAMPLE)
-        question_similarity_score = compare_images(RegionQuestion, QUESTION_SAMPLE)
+        answer_similarity_score = similarity_score(preprocess(RegionAnswer), preprocess(ANSWER_SAMPLE))
+        question_similarity_score = similarity_score(preprocess(RegionQuestion), preprocess(QUESTION_SAMPLE))
 
         answer_match = answer_similarity_score > ANSWER_SIMILARITY_THRESHOLD
         question_match = question_similarity_score > QUESTION_SIMILARITY_THRESHOLD
@@ -200,32 +291,36 @@ def run_game():
         elif question_match and not answer_match:
             state = "question"
         else:
-            # both matched
             if answer_similarity_score > question_similarity_score:
                 state = "answer"
             else:
                 state = "question"
 
-        #we dont care if its the same stage
         if (state == last_state):
-            print(f"Same as last state: {state}")
             time.sleep(1)
             continue
         
-        #only record the information if its a new stage
         if (state == "question"):
             print("its the question phase")
-            question_phase_data = question_phase(image)
+            if not DEBUG_MODE:
+                question_phase_data = question_phase(image)
+            else:
+                question_phase_data, question_log, batch_dir = question_phase(image, debug=True)
 
         elif (state == "answer"):
             print("its the answer phase")
-            answer_phase(image, memory=question_phase_data)
-            
+            if DEBUG_MODE:
+                answer_idx = answer_phase(image, question_phase_data, batch_dir, question_log, debug=True)
+            else:
+                answer_idx = answer_phase(image, question_phase_data, None, None, debug=False)
+
+            if answer_idx is not None:
+                answer_regions = [ANSWER1, ANSWER2, ANSWER3]
+                click_region(answer_regions[answer_idx])
         else:
             print("its neither")
 
         last_state = state
         time.sleep(1)
-        continue
 
 run_game()
