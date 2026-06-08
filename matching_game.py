@@ -11,7 +11,6 @@ CONFIG_FILE = "matching_game.json"
 REGION_FILE = "matching_regions.json"
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-batch_counter = 0
 
 with open(CONFIG_FILE, 'r') as f:
     config = json.load(f)
@@ -37,9 +36,22 @@ ANSWER1 = region_config.get("answer_1", [0, 0, 0, 0])
 ANSWER2 = region_config.get("answer_2", [0, 0, 0, 0])
 ANSWER3 = region_config.get("answer_3", [0, 0, 0, 0])
 
+ICON_TEXT_MATCH_MIN = 0.12
+ICON_TEXT_MARGIN_MIN = 0.02
+TEXT_AMBIGUITY_MARGIN = 0.03
+ICON_SELECT_MARGIN = 0.20
 
-def question_phase(image, debug=False):
-    global batch_counter
+
+def initial_batch_counter():
+    existing = [
+        int(path.name.split("_")[1])
+        for path in Path(LOG_DIR).glob("batch_*")
+        if path.is_dir() and path.name.split("_")[1].isdigit()
+    ]
+    return max(existing, default=0)
+
+
+def question_phase(image):
     cropped_icon1 = crop_region(image, QUESTION_ICON1)
     cropped_icon2 = crop_region(image, QUESTION_ICON2)
     cropped_icon3 = crop_region(image, QUESTION_ICON3)
@@ -47,131 +59,170 @@ def question_phase(image, debug=False):
     cropped_label2 = crop_region(image, QUESTION_LABEL2)
     cropped_label3 = crop_region(image, QUESTION_LABEL3)
 
-    question_phase_data = [
+    return [
         (cropped_icon1, cropped_label1),
         (cropped_icon2, cropped_label2),
-        (cropped_icon3, cropped_label3)
+        (cropped_icon3, cropped_label3),
     ]
 
-    if debug:
-        batch_counter += 1
-        batch_dir = Path(LOG_DIR) / f"batch_{batch_counter:04d}"
-        batch_dir.mkdir(parents=True, exist_ok=True)
+def question_capture_quality(memory):
+    icon_pixels = [cv2.countNonZero(preprocess_icon(icon)) for icon, _ in memory]
+    if not icon_pixels or min(icon_pixels) < 15:
+        return 0
+    return sum(icon_pixels)
 
-        question_log = {"icons": [], "labels": []}
-        for i, (icon, label) in enumerate(question_phase_data, start=1):
-            question_log["icons"].append(save_image_pair(batch_dir, f"question_icon_{i}", icon, is_icon=True))
-            question_log["labels"].append(save_image_pair(batch_dir, f"question_label_{i}", label, is_icon=False))
-        return question_phase_data, question_log, batch_dir
+def build_question_log(batch_dir, memory):
+    question_log = {"icons": [], "labels": []}
+    for i, (icon, label) in enumerate(memory, start=1):
+        question_log["icons"].append(save_image_pair(batch_dir, f"question_icon_{i}", icon, is_icon=True))
+        question_log["labels"].append(save_image_pair(batch_dir, f"question_label_{i}", label, is_icon=False))
+    return question_log
 
-    return question_phase_data
+def score_icon_answer_pairs(answer_icon, memory, answers):
+    icon_scores = []
+    for icon_idx, (icon_img, _) in enumerate(memory):
+        icon_details = icon_similarity_details(answer_icon, icon_img)
+        icon_scores.append({
+            "question_icon": icon_idx + 1,
+            "icon_score": icon_details["total"],
+            "icon_details": icon_details,
+        })
+    icon_scores.sort(key=lambda row: -row["icon_score"])
+    icon_shape_margin = (
+        icon_scores[0]["icon_score"] - icon_scores[1]["icon_score"]
+        if len(icon_scores) > 1 else icon_scores[0]["icon_score"]
+    )
+    selected_icons = (
+        {icon_scores[0]["question_icon"]}
+        if icon_shape_margin >= ICON_SELECT_MARGIN
+        else {row["question_icon"] for row in icon_scores}
+    )
+
+    pairs = []
+    for icon_idx, (icon_img, label_img) in enumerate(memory):
+        icon_details = icon_similarity_details(answer_icon, icon_img)
+        icon_score = icon_details["total"]
+        label_text = read_label_ocr(label_img)
+        for answer_idx, answer_img in enumerate(answers):
+            answer_text = read_label_ocr(answer_img)
+            text_score = text_similarity(label_text, answer_text)
+            combined = icon_score * (0.25 + 0.75 * text_score)
+            pairs.append({
+                "question_icon": icon_idx + 1,
+                "answer": answer_idx + 1,
+                "icon_score": float(icon_score),
+                "icon_details": icon_details,
+                "label_text": label_text,
+                "answer_text": answer_text,
+                "text_score": float(text_score),
+                "combined": float(combined),
+                "icon_locked": (icon_idx + 1) in selected_icons,
+            })
+
+    eligible = [row for row in pairs if row["icon_locked"]]
+    eligible.sort(key=lambda row: row["combined"], reverse=True)
+    pairs.sort(key=lambda row: row["combined"], reverse=True)
+    return pairs, eligible[0], icon_shape_margin
+
+def skip_reason_for_pairs(pairs):
+    best = pairs[0]
+    second = pairs[1] if len(pairs) > 1 else None
+    margin = best["combined"] - second["combined"] if second else best["combined"]
+
+    if best["text_score"] >= 1.0 and best["label_text"] and best["answer_text"]:
+        for other in pairs[1:]:
+            if other["text_score"] >= 1.0 and (best["combined"] - other["combined"]) < TEXT_AMBIGUITY_MARGIN:
+                return f"Ambiguous perfect text matches (margin < {TEXT_AMBIGUITY_MARGIN})"
+        return None
+
+    if second and margin < ICON_TEXT_MARGIN_MIN:
+        return f"Match too ambiguous (margin < {ICON_TEXT_MARGIN_MIN})"
+
+    if best["combined"] < ICON_TEXT_MATCH_MIN:
+        return f"Match confidence too low ({best['combined']:.4f})"
+
+    return None
+
+def write_decision_log(batch_dir, question_log, answer_log, pairs, best, margin,
+                       icon_shape_margin=0.0, skipped=False, skip_reason=None):
+    log_entry = {
+        "timestamp": time.time(),
+        "skipped": skipped,
+        "skip_reason": skip_reason,
+        "matched_question_icon": best["question_icon"],
+        "target_ocr_text": best["label_text"],
+        "icon_shape_similarity": best["icon_score"],
+        "icon_margin": float(margin),
+        "icon_shape_margin": float(icon_shape_margin),
+        "pair_scores": pairs,
+        "selected_answer": None if skipped else best["answer"],
+        "selected_answer_score": best["text_score"],
+        "combined_score": best["combined"],
+        "question_files": question_log,
+        "answer_files": answer_log,
+    }
+    with open(batch_dir / "decision.json", "w") as f:
+        json.dump(log_entry, f, indent=4)
 
 def answer_phase(image, memory, batch_dir, question_log, debug=False):
     answer_icon = crop_region(image, ANSWER_ICON)
-    cropped_answer1 = crop_region(image, ANSWER1)
-    cropped_answer2 = crop_region(image, ANSWER2)
-    cropped_answer3 = crop_region(image, ANSWER3)
+    answers = [
+        crop_region(image, ANSWER1),
+        crop_region(image, ANSWER2),
+        crop_region(image, ANSWER3),
+    ]
 
     assert memory is not None, "Memory should be initialized."
 
-    icon_scores = []
-    best_icon_score = -1
-    best_icon_idx = None
-
-    mask_answer = preprocess_icon(answer_icon)
-
-    for i, (icon_img, _) in enumerate(memory):
-        if icon_img is not None:
-            mask_question = preprocess_icon(icon_img)
-            score = similarity_score(mask_answer, mask_question)
-
-            icon_scores.append({
-                "question_icon": i + 1,
-                "score": float(score)
-            })
-
-            if debug:
-                print(f"Comparing shapes of answer mask with question mask {i+1}, score: {score:.4f}")
-
-            if score > best_icon_score:
-                best_icon_score = score
-                best_icon_idx = i
-
-    if len(icon_scores) >= 2:
-        sorted_icon_scores = sorted([s["score"] for s in icon_scores], reverse=True)
-        margin = sorted_icon_scores[0] - sorted_icon_scores[1]
-
-        if debug:
-            print(f"Icon Shape match margin (1st vs 2nd): {margin:.4f}")
-
-        if margin < 0.05:
-            print("Icon shape overlap too ambiguous (margin < 0.05), skipping click.")
-            return None
+    pairs, best, icon_shape_margin = score_icon_answer_pairs(answer_icon, memory, answers)
+    eligible = [row for row in pairs if row["icon_locked"]]
+    margin = (
+        eligible[0]["combined"] - eligible[1]["combined"]
+        if len(eligible) > 1 else eligible[0]["combined"]
+    )
+    skip_reason = skip_reason_for_pairs(eligible)
 
     if debug:
-        print(f"Best structural mask shape match found: {best_icon_idx + 1} with score {best_icon_score:.4f}")
+        for row in pairs:
+            print(
+                f"Pair icon={row['question_icon']} ans={row['answer']}: "
+                f"icon={row['icon_score']:.4f}, text={row['text_score']:.4f}, "
+                f"label={row['label_text']!r}, option={row['answer_text']!r}, "
+                f"combined={row['combined']:.4f}"
+            )
+        print(f"Icon shape margin (1st vs 2nd icon): {icon_shape_margin:.4f}")
+        print(f"Best pair margin (1st vs 2nd): {margin:.4f}")
 
-    target_text = read_label_ocr(memory[best_icon_idx][1])
-    if debug:
-        print(f"Target memory string read via OCR: '{target_text}'")
-
-    answers = [cropped_answer1, cropped_answer2, cropped_answer3]
-    answer_scores = []
-    best_idx = None
-    best_score = -1
-
-    for i, answer in enumerate(answers):
-        option_text = read_label_ocr(answer)
-        score = text_similarity(target_text, option_text)
-
-        if debug:
-            print(f"Option {i+1} OCR text: '{option_text}' | String similarity score: {score:.4f}")
-
-        answer_scores.append({
-            "answer": i + 1,
-            "detected_text": option_text,
-            "score": float(score)
-        })
-
-        if score > best_score:
-            best_score = score
-            best_idx = i
-
-    if debug:
-        answer_log = {}
-        answer_log["answer_icon"] = save_image_pair(batch_dir, "answer_icon", answer_icon, is_icon=True)
-
+        answer_log = {"answer_icon": save_image_pair(batch_dir, "answer_icon", answer_icon, is_icon=True)}
         for i, ans in enumerate(answers, start=1):
             answer_log[f"answer_{i}"] = save_image_pair(batch_dir, f"answer_{i}", ans, is_icon=False)
 
-        log_entry = {
-            "timestamp": time.time(),
-            "matched_question_icon": best_icon_idx + 1 if best_icon_idx is not None else None,
-            "target_ocr_text": target_text,
-            "icon_shape_similarity": float(best_icon_score),
-            "icon_margin": float(margin) if 'margin' in locals() else None,
-            "answer_scores": answer_scores,
-            "selected_answer": best_idx + 1 if best_idx is not None else None,
-            "selected_answer_score": float(best_score),
-            "question_files": question_log,
-            "answer_files": answer_log
-        }
-        with open(batch_dir / "decision.json", "w") as f:
-            json.dump(log_entry, f, indent=4)
+        write_decision_log(
+            batch_dir, question_log, answer_log, pairs, best, margin, icon_shape_margin,
+            skipped=skip_reason is not None,
+            skip_reason=skip_reason,
+        )
 
-    if best_score < 0.5:
-        print("Text match validation confidence too low, skipping click.")
+    if skip_reason:
+        print(f"{skip_reason}, skipping click.")
         return None
 
-    print(f"Selected answer {best_idx + 1} (text match score={best_score:.4f})")
-    return best_idx
+    print(
+        f"Selected icon {best['question_icon']} / answer {best['answer']} "
+        f"(combined={best['combined']:.4f}, text={best['text_score']:.4f})"
+    )
+    return best["answer"] - 1
 
 def run_game():
-    state = "not started"
     last_state = None
     question_sample = crop_region(QUESTION_IMAGE, QUESTION_STATE_ROI)
     answer_sample = crop_region(ANSWER_IMAGE, ANSWER_STATE_ROI)
     question_phase_data = []
+    question_ready = False
+    best_question_quality = 0
+    batch_counter = initial_batch_counter()
+    batch_dir = None
+    question_log = None
 
     while True:
         image = screenshot_game(WINDOW_TITLE)
@@ -181,29 +232,41 @@ def run_game():
             QUESTION_SIMILARITY_THRESHOLD, ANSWER_SIMILARITY_THRESHOLD
         )
 
-        if (state == last_state):
-            time.sleep(1)
-            continue
+        if state == "question":
+            candidate = question_phase(image)
+            quality = question_capture_quality(candidate)
+            if quality >= best_question_quality:
+                question_phase_data = candidate
+                best_question_quality = quality
+            question_ready = True
 
-        if (state == "question"):
-            print("its the question phase")
-            if not DEBUG_MODE:
-                question_phase_data = question_phase(image)
+        elif state == "answer" and state != last_state:
+            if not question_ready:
+                print("No question data captured for this round, skipping.")
             else:
-                question_phase_data, question_log, batch_dir = question_phase(image, debug=True)
+                if DEBUG_MODE:
+                    batch_counter += 1
+                    batch_dir = Path(LOG_DIR) / f"batch_{batch_counter:04d}"
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+                    question_log = build_question_log(batch_dir, question_phase_data)
+                    answer_idx = answer_phase(image, question_phase_data, batch_dir, question_log, debug=True)
+                else:
+                    answer_idx = answer_phase(image, question_phase_data, None, None, debug=False)
 
-        elif (state == "answer"):
-            print("its the answer phase")
-            if DEBUG_MODE:
-                answer_idx = answer_phase(image, question_phase_data, batch_dir, question_log, debug=True)
+                if answer_idx is not None:
+                    answer_regions = [ANSWER1, ANSWER2, ANSWER3]
+                    click_region(WINDOW_TITLE, answer_regions[answer_idx])
+                question_ready = False
+                best_question_quality = 0
+
+        if state != last_state:
+            if state == "question":
+                print("its the question phase")
+            elif state == "answer":
+                print("its the answer phase")
             else:
-                answer_idx = answer_phase(image, question_phase_data, None, None, debug=False)
-
-            if answer_idx is not None:
-                answer_regions = [ANSWER1, ANSWER2, ANSWER3]
-                click_region(WINDOW_TITLE, answer_regions[answer_idx])
-        else:
-            print("its neither")
+                print("its neither")
+                best_question_quality = 0
 
         last_state = state
         time.sleep(1)

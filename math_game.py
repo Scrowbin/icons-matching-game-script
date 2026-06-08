@@ -10,7 +10,6 @@ CONFIG_FILE = "math_config.json"
 REGION_FILE = "math_regions.json"
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-batch_counter = 0
 
 with open(CONFIG_FILE, 'r') as f:
     config = json.load(f)
