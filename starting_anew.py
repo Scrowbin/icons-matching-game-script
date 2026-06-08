@@ -4,12 +4,14 @@ import numpy as np
 import time
 import json
 import os
-from datetime import datetime
+import difflib
+import pytesseract
 from pathlib import Path
 
 # Global Debug Toggle
 DEBUG_MODE = True
-
+#hardcoded, too lazy to edit path
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 CONFIG_FILE = "game_config.json"
 REGION_FILE = "regions.json"
 LOG_DIR = "logs"
@@ -129,6 +131,21 @@ def similarity_score(img1, img2):
     result = cv2.matchTemplate(img1_resized, img2_resized, cv2.TM_CCOEFF_NORMED)
     return float(result.max())
 
+def read_label_ocr(img):
+    """Uses Tesseract OCR to read text labels from cropped UI regions."""
+    thresh = preprocess(img)
+    # PSM 7 treats the image as a single text line, ideal for game labels/digits
+    text = pytesseract.image_to_string(thresh, config='--psm 7').strip()
+    return text
+
+def text_similarity(str1, str2):
+    """Performs a fuzzy string comparison to protect against minor OCR misreads."""
+    if not str1 and not str2:
+        return 1.0
+    if not str1 or not str2:
+        return 0.0
+    return difflib.SequenceMatcher(None, str1.lower(), str2.lower()).ratio() # <--- CORRECT
+
 def save_image_pair(folder, name, img, is_icon=False):
     raw_path = folder / f"{name}_raw.png"
     thresh_path = folder / f"{name}_thresholded.png"
@@ -181,13 +198,15 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
     best_icon_score = -1
     best_icon_idx = None
 
+    # Step 1: Turn the answer icon into a binary shape profile using HSV
     mask_answer = preprocess_icon(answer_icon)
 
     for i, (icon_img, _) in enumerate(memory):
         if icon_img is not None:
+            # Step 2: Extract the binary shape profile of the saved question icon
             mask_question = preprocess_icon(icon_img)
 
-            # Clean and unclogged comparison call
+            # Step 3: Compare shapes directly by passing the binary masks into similarity_score
             score = similarity_score(mask_answer, mask_question)
             
             icon_scores.append({
@@ -196,7 +215,7 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
             })
             
             if debug:
-                print(f"Comparing answer icon with question icon {i+1}, score: {score:.4f}")
+                print(f"Comparing shapes of answer mask with question mask {i+1}, score: {score:.4f}")
             
             if score > best_icon_score:
                 best_icon_score = score
@@ -208,14 +227,19 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
         margin = sorted_icon_scores[0] - sorted_icon_scores[1]
         
         if debug:
-            print(f"Icon match margin (1st vs 2nd): {margin:.4f}")
+            print(f"Icon Shape match margin (1st vs 2nd): {margin:.4f}")
             
         if margin < 0.05:
-            print("Icon match too ambiguous (margin < 0.05), skipping click.")
+            print("Icon shape overlap too ambiguous (margin < 0.05), skipping click.")
             return None
     
     if debug:
-        print(f"Best icon match: {best_icon_idx + 1} with score {best_icon_score:.4f}")
+        print(f"Best structural mask shape match found: {best_icon_idx + 1} with score {best_icon_score:.4f}")
+
+    # Step 4: Extract the Text identity using OCR
+    target_text = read_label_ocr(memory[best_icon_idx][1])
+    if debug:
+        print(f"Target memory string read via OCR: '{target_text}'")
 
     answers = [cropped_answer1, cropped_answer2, cropped_answer3]
     answer_scores = []
@@ -223,13 +247,15 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
     best_score = -1
 
     for i, answer in enumerate(answers):
-        # Clean label comparison using the unified similarity_score function
-        score = similarity_score(
-            preprocess(memory[best_icon_idx][1]),
-            preprocess(answer)
-        )
+        option_text = read_label_ocr(answer)
+        score = text_similarity(target_text, option_text)
+        
+        if debug:
+            print(f"Option {i+1} OCR text: '{option_text}' | String similarity score: {score:.4f}")
+
         answer_scores.append({
             "answer": i + 1,
+            "detected_text": option_text,
             "score": float(score)
         })
 
@@ -247,7 +273,8 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
         log_entry = {
             "timestamp": time.time(),
             "matched_question_icon": best_icon_idx + 1 if best_icon_idx is not None else None,
-            "icon_similarity": float(best_icon_score),
+            "target_ocr_text": target_text,
+            "icon_shape_similarity": float(best_icon_score),
             "icon_margin": float(margin) if 'margin' in locals() else None,
             "answer_scores": answer_scores,
             "selected_answer": best_idx + 1 if best_idx is not None else None,
@@ -258,11 +285,11 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
         with open(batch_dir / "decision.json", "w") as f:
             json.dump(log_entry, f, indent=4)
             
-    if best_score < 0.6:
-        print("Confidence too low, skipping click")
+    if best_score < 0.5:
+        print("Text match validation confidence too low, skipping click.")
         return None
     
-    print(f"Selected answer {best_idx + 1} (score={best_score:.4f})")
+    print(f"Selected answer {best_idx + 1} (text match score={best_score:.4f})")
     return best_idx
 
 def run_game():
