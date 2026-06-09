@@ -236,11 +236,168 @@ def similarity_score(img1, img2):
     result = cv2.matchTemplate(img1_resized, img2_resized, cv2.TM_CCOEFF_NORMED)
     return float(result.max())
 
-def read_label_ocr(img):
-    """Uses Tesseract OCR to read text labels from cropped UI regions."""
-    thresh = preprocess(img)
-    text = pytesseract.image_to_string(thresh, config='--psm 7').strip()
-    return text
+def label_gray_inverted(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img.copy()
+    if float(gray.mean()) < 127:
+        gray = 255 - gray
+    return gray
+
+def default_label_upscale(min_dim):
+    if min_dim >= 64:
+        return 1
+    return max(2, (64 + min_dim - 1) // min_dim)
+
+def preprocess_label_at_scale(img, scale):
+    """Prepare a label crop at a specific upscale factor."""
+    if img is None or img.size == 0:
+        return None
+
+    gray = label_gray_inverted(img)
+    h, w = gray.shape[:2]
+    if scale > 1:
+        gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return cv2.copyMakeBorder(thresh, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+
+def preprocess_label_for_ocr(img):
+    """Prepare a small white-on-dark label crop for Tesseract."""
+    if img is None or img.size == 0:
+        return None
+    min_dim = min(img.shape[:2])
+    return preprocess_label_at_scale(img, default_label_upscale(min_dim))
+
+def preprocess_label_for_ocr_alt(img):
+    """Alternate threshold for difficult digit crops."""
+    if img is None or img.size == 0:
+        return None
+
+    gray = label_gray_inverted(img)
+    h, w = gray.shape[:2]
+    scale = default_label_upscale(min(h, w))
+    if scale > 1:
+        gray = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    return cv2.copyMakeBorder(thresh, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=255)
+
+def digit_image_similarity(label_img, answer_img):
+    """Compare two digit crops visually when OCR is unreliable."""
+    a = preprocess_label_at_scale(label_img, 1)
+    b = preprocess_label_at_scale(answer_img, 1)
+    if a is None or b is None:
+        return 0.0
+    return similarity_score(a, b)
+
+def ocr_best_confidence(img, config, digits_only=False):
+    best_text = ""
+    best_conf = -1
+    try:
+        data = pytesseract.image_to_data(
+            img, config=config, output_type=pytesseract.Output.DICT
+        )
+    except pytesseract.TesseractError:
+        data = None
+
+    if data:
+        for text, conf in zip(data["text"], data["conf"]):
+            text = text.strip()
+            conf = int(conf)
+            if conf <= 0 or not text:
+                continue
+            if digits_only:
+                digits = "".join(ch for ch in text if ch.isdigit())
+                if not digits:
+                    continue
+                text = digits[0]
+            if conf > best_conf:
+                best_conf = conf
+                best_text = text
+
+    if not best_text:
+        try:
+            fallback = pytesseract.image_to_string(img, config=config).strip()
+        except pytesseract.TesseractError:
+            fallback = ""
+        if digits_only:
+            digits = "".join(ch for ch in fallback if ch.isdigit())
+            if len(digits) == 1:
+                return digits, 50
+            return "", -1
+        if fallback:
+            return fallback, 50
+
+    return best_text, best_conf
+
+def try_ocr_digit_on_image(prep):
+    best_text = ""
+    best_conf = -1
+    for config in (
+        "--psm 10 -c tessedit_char_whitelist=0123456789",
+        "--psm 8 -c tessedit_char_whitelist=0123456789",
+    ):
+        text, conf = ocr_best_confidence(prep, config, digits_only=True)
+        if text and conf > best_conf:
+            best_text, best_conf = text, conf
+    return best_text, best_conf
+
+def read_digit_ocr(img):
+    """Fast single-digit OCR with multi-scale fallback for glyphs like 0."""
+    if img is None or img.size == 0:
+        return ""
+
+    min_dim = min(img.shape[:2])
+    default_scale = default_label_upscale(min_dim)
+    scales = []
+    for scale in (default_scale, 1, 3):
+        if scale not in scales:
+            scales.append(scale)
+
+    best_text = ""
+    best_conf = -1
+    for scale in scales:
+        prep = preprocess_label_at_scale(img, scale)
+        if prep is None:
+            continue
+        text, conf = try_ocr_digit_on_image(prep)
+        if text and conf > best_conf:
+            best_text, best_conf = text, conf
+        if text and conf >= 60:
+            return text
+
+    alternate = preprocess_label_for_ocr_alt(img)
+    if alternate is not None:
+        text, conf = try_ocr_digit_on_image(alternate)
+        if text and conf > best_conf:
+            best_text = text
+
+    return best_text
+
+def read_label_ocr(img, digits_only=False):
+    """Read text from a cropped UI label."""
+    if digits_only:
+        return read_digit_ocr(img)
+
+    primary = preprocess_label_for_ocr(img)
+    if primary is None:
+        return ""
+
+    whitelist = "0123456789+-*/xX() "
+    text, conf = ocr_best_confidence(
+        primary, f"--psm 7 -c tessedit_char_whitelist={whitelist}"
+    )
+    if text and conf >= 50:
+        return text.strip()
+
+    alt_text, alt_conf = ocr_best_confidence(
+        primary, f"--psm 6 -c tessedit_char_whitelist={whitelist}"
+    )
+    if alt_conf > conf and alt_text:
+        text = alt_text
+    return text.strip()
 
 def icon_similarity_details(img1, img2):
     mask1 = preprocess_icon(img1)
@@ -279,12 +436,16 @@ def text_similarity(str1, str2):
     return difflib.SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
 
 def state_detection(image, question_sample, answer_sample, question_state_roi, answer_state_roi,
-                    question_threshold, answer_threshold):
+                    question_threshold, answer_threshold, debug=False):
     region_question = crop_region(image, question_state_roi)
     region_answer = crop_region(image, answer_state_roi)
 
     answer_similarity_score = similarity_score(preprocess(region_answer), preprocess(answer_sample))
     question_similarity_score = similarity_score(preprocess(region_question), preprocess(question_sample))
+
+    if debug:
+        print(f"Answer similarity: {answer_similarity_score}")
+        print(f"Question similarity: {question_similarity_score}")
 
     answer_match = answer_similarity_score > answer_threshold
     question_match = question_similarity_score > question_threshold

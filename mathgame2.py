@@ -4,7 +4,7 @@ import os
 import json
 import re
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 CONFIG_FILE = "math_config.json"
 REGION_FILE = "math_regions.json"
@@ -25,9 +25,9 @@ with open(REGION_FILE, 'r') as f:
 QUESTION_STATE_ROI = region_config.get("question_state_roi", [0, 0, 0, 0])
 QUESTION = region_config.get("question", [0, 0, 0, 0])
 ANSWER_STATE_ROI = region_config.get("answer_state_roi", [0, 0, 0, 0])
-JUMP_1_BUTTON = region_config.get("jump_1_button", [0, 0, 0, 0])
-JUMP_5_BUTTON = region_config.get("jump_5_button", [0, 0, 0, 0])
-NEXT_BUTTON = region_config.get("next_button", [0, 0, 0, 0])
+FIRST_ANSWER = region_config.get("jump_1_button", [0, 0, 0, 0])
+SECOND_ANSWER = region_config.get("jump_5_button", [0, 0, 0, 0])
+THIRD_ANSWER = region_config.get("next_button", [0, 0, 0, 0])
 
 
 def parse_and_solve_math(ocr_text):
@@ -57,18 +57,16 @@ def question_phase(image, debug=False):
     return result
 
 def answer_phase(result, debug=False):
-    num_press_jump_1 = result % 5
-    num_press_jump_5 = result // 5
-    if debug:
-        print(f"Calculated jumps: {num_press_jump_5} x 5-jumps and {num_press_jump_1} x 1-jumps")
+    answers = [FIRST_ANSWER, SECOND_ANSWER, THIRD_ANSWER]
 
-    for _ in range(num_press_jump_1):
-        click_region(WINDOW_TITLE, JUMP_1_BUTTON, debug=debug)
-        time.sleep(0.2)
-    for _ in range(num_press_jump_5):
-        click_region(WINDOW_TITLE, JUMP_5_BUTTON, debug=debug)
-        time.sleep(0.2)
-    click_region(WINDOW_TITLE, NEXT_BUTTON, debug=debug)
+    for answer in answers:
+        read_answer = read_label_ocr(crop_region(image, answer))
+        if debug:
+            print(f"Answer OCR: '{read_answer}'")
+        if read_answer == result:
+            click_region(WINDOW_TITLE, answer, debug=debug)
+            return
+
 
 def run_game():
     state = "not started"
@@ -82,7 +80,7 @@ def run_game():
         state = state_detection(
             image, question_sample, answer_sample,
             QUESTION_STATE_ROI, ANSWER_STATE_ROI,
-            QUESTION_SIMILARITY_THRESHOLD, ANSWER_SIMILARITY_THRESHOLD, debug=DEBUG_MODE
+            QUESTION_SIMILARITY_THRESHOLD, ANSWER_SIMILARITY_THRESHOLD
         )
 
         if (state == last_state):

@@ -79,9 +79,11 @@ def build_question_log(batch_dir, memory):
     return question_log
 
 def score_icon_answer_pairs(answer_icon, memory, answers):
+    icon_details_by_idx = []
     icon_scores = []
     for icon_idx, (icon_img, _) in enumerate(memory):
         icon_details = icon_similarity_details(answer_icon, icon_img)
+        icon_details_by_idx.append(icon_details)
         icon_scores.append({
             "question_icon": icon_idx + 1,
             "icon_score": icon_details["total"],
@@ -98,14 +100,26 @@ def score_icon_answer_pairs(answer_icon, memory, answers):
         else {row["question_icon"] for row in icon_scores}
     )
 
+    label_texts = [
+        read_label_ocr(label_img, digits_only=True)
+        for _, label_img in memory
+    ]
+    answer_texts = [
+        read_label_ocr(answer_img, digits_only=True)
+        for answer_img in answers
+    ]
+
     pairs = []
-    for icon_idx, (icon_img, label_img) in enumerate(memory):
-        icon_details = icon_similarity_details(answer_icon, icon_img)
+    for icon_idx, (_, label_img) in enumerate(memory):
+        icon_details = icon_details_by_idx[icon_idx]
         icon_score = icon_details["total"]
-        label_text = read_label_ocr(label_img)
+        label_text = label_texts[icon_idx]
         for answer_idx, answer_img in enumerate(answers):
-            answer_text = read_label_ocr(answer_img)
-            text_score = text_similarity(label_text, answer_text)
+            answer_text = answer_texts[answer_idx]
+            if not label_text:
+                text_score = digit_image_similarity(label_img, answer_img)
+            else:
+                text_score = text_similarity(label_text, answer_text)
             combined = icon_score * (0.25 + 0.75 * text_score)
             pairs.append({
                 "question_icon": icon_idx + 1,
@@ -164,7 +178,7 @@ def write_decision_log(batch_dir, question_log, answer_log, pairs, best, margin,
     with open(batch_dir / "decision.json", "w") as f:
         json.dump(log_entry, f, indent=4)
 
-def answer_phase(image, memory, batch_dir, question_log, debug=False):
+def answer_phase(image, memory):
     answer_icon = crop_region(image, ANSWER_ICON)
     answers = [
         crop_region(image, ANSWER1),
@@ -182,36 +196,51 @@ def answer_phase(image, memory, batch_dir, question_log, debug=False):
     )
     skip_reason = skip_reason_for_pairs(eligible)
 
-    if debug:
-        for row in pairs:
-            print(
-                f"Pair icon={row['question_icon']} ans={row['answer']}: "
-                f"icon={row['icon_score']:.4f}, text={row['text_score']:.4f}, "
-                f"label={row['label_text']!r}, option={row['answer_text']!r}, "
-                f"combined={row['combined']:.4f}"
-            )
-        print(f"Icon shape margin (1st vs 2nd icon): {icon_shape_margin:.4f}")
-        print(f"Best pair margin (1st vs 2nd): {margin:.4f}")
-
-        answer_log = {"answer_icon": save_image_pair(batch_dir, "answer_icon", answer_icon, is_icon=True)}
-        for i, ans in enumerate(answers, start=1):
-            answer_log[f"answer_{i}"] = save_image_pair(batch_dir, f"answer_{i}", ans, is_icon=False)
-
-        write_decision_log(
-            batch_dir, question_log, answer_log, pairs, best, margin, icon_shape_margin,
-            skipped=skip_reason is not None,
-            skip_reason=skip_reason,
-        )
-
     if skip_reason:
         print(f"{skip_reason}, skipping click.")
-        return None
+        answer_idx = None
+    else:
+        print(
+            f"Selected icon {best['question_icon']} / answer {best['answer']} "
+            f"(combined={best['combined']:.4f}, text={best['text_score']:.4f})"
+        )
+        answer_idx = best["answer"] - 1
 
-    print(
-        f"Selected icon {best['question_icon']} / answer {best['answer']} "
-        f"(combined={best['combined']:.4f}, text={best['text_score']:.4f})"
+    return {
+        "answer_idx": answer_idx,
+        "answer_icon": answer_icon,
+        "answers": answers,
+        "pairs": pairs,
+        "best": best,
+        "margin": margin,
+        "icon_shape_margin": icon_shape_margin,
+        "skip_reason": skip_reason,
+    }
+
+def write_answer_debug_log(batch_dir, memory, result):
+    for row in result["pairs"]:
+        print(
+            f"Pair icon={row['question_icon']} ans={row['answer']}: "
+            f"icon={row['icon_score']:.4f}, text={row['text_score']:.4f}, "
+            f"label={row['label_text']!r}, option={row['answer_text']!r}, "
+            f"combined={row['combined']:.4f}"
+        )
+    print(f"Icon shape margin (1st vs 2nd icon): {result['icon_shape_margin']:.4f}")
+    print(f"Best pair margin (1st vs 2nd): {result['margin']:.4f}")
+
+    question_log = build_question_log(batch_dir, memory)
+    answer_log = {
+        "answer_icon": save_image_pair(batch_dir, "answer_icon", result["answer_icon"], is_icon=True)
+    }
+    for i, ans in enumerate(result["answers"], start=1):
+        answer_log[f"answer_{i}"] = save_image_pair(batch_dir, f"answer_{i}", ans, is_icon=False)
+
+    write_decision_log(
+        batch_dir, question_log, answer_log, result["pairs"], result["best"],
+        result["margin"], result["icon_shape_margin"],
+        skipped=result["skip_reason"] is not None,
+        skip_reason=result["skip_reason"],
     )
-    return best["answer"] - 1
 
 def run_game():
     last_state = None
@@ -221,8 +250,6 @@ def run_game():
     question_ready = False
     best_question_quality = 0
     batch_counter = initial_batch_counter()
-    batch_dir = None
-    question_log = None
 
     while True:
         image = screenshot_game(WINDOW_TITLE)
@@ -244,18 +271,21 @@ def run_game():
             if not question_ready:
                 print("No question data captured for this round, skipping.")
             else:
+                batch_dir = None
                 if DEBUG_MODE:
                     batch_counter += 1
                     batch_dir = Path(LOG_DIR) / f"batch_{batch_counter:04d}"
                     batch_dir.mkdir(parents=True, exist_ok=True)
-                    question_log = build_question_log(batch_dir, question_phase_data)
-                    answer_idx = answer_phase(image, question_phase_data, batch_dir, question_log, debug=True)
-                else:
-                    answer_idx = answer_phase(image, question_phase_data, None, None, debug=False)
 
-                if answer_idx is not None:
+                result = answer_phase(image, question_phase_data)
+
+                if result["answer_idx"] is not None:
                     answer_regions = [ANSWER1, ANSWER2, ANSWER3]
-                    click_region(WINDOW_TITLE, answer_regions[answer_idx])
+                    click_region(WINDOW_TITLE, answer_regions[result["answer_idx"]])
+
+                if DEBUG_MODE and batch_dir is not None:
+                    write_answer_debug_log(batch_dir, question_phase_data, result)
+
                 question_ready = False
                 best_question_quality = 0
 
